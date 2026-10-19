@@ -20,47 +20,67 @@ small{color:#666}
 </style></head><body>
 <div id="login"><h3>🚌 School Transport Demo</h3>
 <input id="u" placeholder="Username"><input id="p" type="password" placeholder="Password">
-<button onclick="login()" style="width:100%;margin-top:8px">Login</button>
-<p><small>Demo logins:<br>admin / admin123<br>driver1 / 1234<br>parent1 / 1234, parent2 / 1234</small></p></div>
-<div id="app" hidden><header><b id="who"></b><button class="gray" onclick="location.reload()">Logout</button></header>
+<button id="lb" onclick="login()" style="width:100%;margin-top:8px">Login</button>
+<p id="warn" style="color:#c0392b;font-weight:bold" hidden>⚠ LOCAL MODE: other phones will NOT see your data. Set DB_URL in the script (see README steps).</p><p><small>Demo logins:<br>admin / admin123<br>driver1 / 1234<br>parent1 / 1234, parent2 / 1234</small></p></div>
+<div id="app" hidden><header><b id="who"></b><span id="sync"></span><button class="gray" onclick="location.reload()">Logout</button></header>
 <div id="panel"></div><div id="map"></div></div>
 <div id="alert" hidden></div>
 <script>
 // ---- CONFIG ----
-// Leave empty = data stays in this browser only (works across tabs of the same browser).
-// For testing on 2 different phones, paste a Firebase Realtime Database URL (test mode), e.g. "https://myapp-default-rtdb.firebaseio.com"
+// Paste your Firebase Realtime Database URL here so all phones share data. Example:
+// const DB_URL = "https://myschool-default-rtdb.firebaseio.com";
 const DB_URL = "";
-const KEY = "tms_demo_v1";
+const KEY = "tms_demo_v2";
 
 const $ = s => document.querySelector(s);
 const seed = {
   users: [
     {id:'a1',role:'admin',name:'School Admin',user:'admin',pass:'admin123'},
     {id:'d1',role:'driver',name:'Ramesh',user:'driver1',pass:'1234',vehicle:'BUS-01',routeId:'r1'},
-    {id:'p1',role:'parent',name:'Parent One',child:'Aarav',user:'parent1',pass:'1234',routeId:'r1',lat:28.6180,lng:77.2150},
-    {id:'p2',role:'parent',name:'Parent Two',child:'Diya',user:'parent2',pass:'1234',routeId:'r1',lat:28.6230,lng:77.2200}
+    {id:'p1',role:'parent',name:'Parent One',child:'Aarav',user:'parent1',pass:'1234',routeId:'r1'},
+    {id:'p2',role:'parent',name:'Parent Two',child:'Diya',user:'parent2',pass:'1234',routeId:'r1'}
   ],
   routes: [{id:'r1',name:'Route 1'}],
   trips: {}
 };
-let S = JSON.parse(localStorage.getItem(KEY) || 'null') || seed;
-let me = null, map = null, mk = {}, tab = 'routes', fitted = false, nFit = 0, marking = false;
+let S = JSON.parse(localStorage.getItem(KEY) || 'null') || JSON.parse(JSON.stringify(seed));
+let me = null, map = null, mk = {}, tab = 'routes', fitted = false, nFit = 0, marking = false, pending = 0;
 let AC = null, ringT = null, watchId = null, sim = null;
-
-function save(){
-  localStorage.setItem(KEY, JSON.stringify(S));
-  if (DB_URL) fetch(DB_URL + '/tms.json', {method:'PUT', body:JSON.stringify(S)}).catch(()=>{});
-}
 function fix(){ S.users=S.users||[]; S.routes=S.routes||[]; S.trips=S.trips||{}; }
 fix();
-addEventListener('storage', e => { if (e.key === KEY && e.newValue) { S = JSON.parse(e.newValue); fix(); onData(); } });
-if (DB_URL) setInterval(async () => {
+function cache(){ localStorage.setItem(KEY, JSON.stringify(S)); }
+
+// Granular writes: each record is saved on its own path, so devices never overwrite each other.
+async function put(path, val){
+  cache();
+  if (!DB_URL) return;
+  pending++;
+  try { await fetch(DB_URL + '/tms/' + path + '.json', {method: val === null ? 'DELETE' : 'PUT', body: JSON.stringify(val)}); setSync(true); }
+  catch (e) { setSync(false); }
+  pending--;
+}
+const saveUser = u => put('users/' + u.id, u);
+const delUser = id => put('users/' + id, null);
+const saveRoute = r => put('routes/' + r.id, r);
+const delRoute = id => put('routes/' + id, null);
+const saveTrip = rid => put('trips/' + rid, S.trips[rid]);
+function setSync(ok){ const e = $('#sync'); if (e) e.textContent = !DB_URL ? '⚠ local only' : ok ? '🟢 synced' : '🔴 sync error'; }
+
+async function pull(){
   try {
     const r = await (await fetch(DB_URL + '/tms.json')).json();
-    if (r && JSON.stringify(r) !== JSON.stringify(S)) { S = r; fix(); localStorage.setItem(KEY, JSON.stringify(S)); onData(); }
-  } catch (e) {}
+    if (!r || !r.users) { seed.users.forEach(u => put('users/' + u.id, u)); seed.routes.forEach(x => put('routes/' + x.id, x)); S = JSON.parse(JSON.stringify(seed)); }
+    else S = {users: Object.values(r.users || {}).filter(Boolean), routes: Object.values(r.routes || {}).filter(Boolean), trips: r.trips || {}};
+    fix(); cache(); setSync(true); return true;
+  } catch (e) { setSync(false); return false; }
+}
+addEventListener('storage', e => { if (!DB_URL && e.key === KEY && e.newValue) { S = JSON.parse(e.newValue); fix(); onData(); } });
+if (DB_URL) setInterval(async () => {
+  if (pending) return;
+  const old = JSON.stringify(S);
+  if (await pull() && JSON.stringify(S) !== old) onData();
 }, 2000);
-if (DB_URL) fetch(DB_URL + '/tms.json').then(r => r.json()).then(r => { if (!r) save(); });
+$('#warn').hidden = !!DB_URL;
 
 function dist(a, b){ // metres
   const R = 6371000, t = x => x * Math.PI / 180;
@@ -81,19 +101,22 @@ function startRing(){ stopRing(); if (!AC) return; beep(); ringT = setInterval(b
 function stopRing(){ clearInterval(ringT); ringT = null; $('#alert').hidden = true; }
 
 // ---- login ----
-function login(){
+async function login(){
+  $('#lb').textContent = 'Connecting…';
+  if (DB_URL && !(await pull())) { $('#lb').textContent = 'Login'; return alert('Cannot reach database. Check DB_URL and Firebase rules.'); }
+  $('#lb').textContent = 'Login';
   const u = S.users.find(x => x.user === $('#u').value.trim() && x.pass === $('#p').value);
   if (!u) return alert('Wrong username or password');
   me = u;
   AC = new (window.AudioContext || window.webkitAudioContext)(); AC.resume();
   if (window.Notification && Notification.permission === 'default') Notification.requestPermission();
-  $('#login').hidden = true; $('#app').hidden = false;
+  $('#login').hidden = true; $('#app').hidden = false; setSync(true);
   $('#who').textContent = me.name + ' (' + me.role + ')';
   map = L.map('map').setView([28.6139, 77.2090], 12);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution:'© OpenStreetMap', maxZoom:19}).addTo(map);
   map.on('click', e => {
     if (me.role == 'parent' && marking) {
-      marking = false; me.lat = e.latlng.lat; me.lng = e.latlng.lng; save(); fitted = false; view();
+      marking = false; me.lat = e.latlng.lat; me.lng = e.latlng.lng; saveUser(me); fitted = false; view();
     }
   });
   navigator.geolocation && navigator.geolocation.getCurrentPosition(p => { if (!fitted) map.setView([p.coords.latitude, p.coords.longitude], 14); });
@@ -141,21 +164,21 @@ function adminView(){
   $('#map').style.display = tab == 'live' ? 'block' : 'none';
   if (tab == 'live') fitted = false;
 }
-function addRoute(){ const n = $('#f1').value.trim(); if (!n) return; S.routes.push({id:'r'+Date.now(), name:n}); save(); view(); }
+function addRoute(){ const n = $('#f1').value.trim(); if (!n) return; const r={id:'r'+Date.now(), name:n}; S.routes.push(r); saveRoute(r); view(); }
 function addUser(role){
   const g = i => $('#f'+i).value.trim();
   if (!g(1) || !g(2) || !g(3)) return alert('Fill name, username, password');
   if (S.users.some(u => u.user == g(2))) return alert('Username already exists');
   const u = {id:'u'+Date.now(), role, name:g(1), user:g(2), pass:g(3), routeId:$('#fr').value};
   if (role == 'driver') u.vehicle = g(4); else u.child = g(4);
-  S.users.push(u); save(); view();
+  S.users.push(u); saveUser(u); view();
 }
-function assign(id, r){ S.users.find(u => u.id == id).routeId = r; save(); }
+function assign(id, r){ const u = S.users.find(u => u.id == id); u.routeId = r; saveUser(u); }
 function del(id, kind){
   if (!confirm('Delete?')) return;
-  if (kind == 'route') { S.routes = S.routes.filter(r => r.id != id); S.users.forEach(u => { if (u.routeId == id) u.routeId = ''; }); }
-  else S.users = S.users.filter(u => u.id != id);
-  save(); view();
+  if (kind == 'route') { S.routes = S.routes.filter(r => r.id != id); delRoute(id); S.users.forEach(u => { if (u.routeId == id) { u.routeId = ''; saveUser(u); } }); }
+  else { S.users = S.users.filter(u => u.id != id); delUser(id); }
+  view();
 }
 function adminList(){
   const L = $('#list'); if (!L) return; let h = '';
@@ -185,10 +208,10 @@ function toggleTrip(){
   if (!me.routeId) return alert('No route assigned');
   const t = myTrip();
   if (t && t.active) {
-    t.active = false; save(); navigator.geolocation.clearWatch(watchId); clearInterval(sim); sim = null;
+    t.active = false; saveTrip(me.routeId); navigator.geolocation.clearWatch(watchId); clearInterval(sim); sim = null;
   } else {
-    S.trips[me.routeId] = {id:Date.now(), active:true, type:$('#tt').value, driverId:me.id, lat:null, lng:null, speed:0, ts:Date.now(), alerted:{}};
-    save();
+    S.trips[me.routeId] = {id:Date.now(), active:true, type:$('#tt').value, driverId:me.id, lat:null, lng:null, speed:0, ts:Date.now()};
+    saveTrip(me.routeId);
     watchId = navigator.geolocation.watchPosition(
       p => setPos(p.coords.latitude, p.coords.longitude, p.coords.speed || 0),
       e => { $('#st').textContent = 'GPS error: ' + e.message + ' (use Simulate)'; },
@@ -198,7 +221,7 @@ function toggleTrip(){
 }
 function setPos(lat, lng, sp){
   const t = myTrip(); if (!t || !t.active) return;
-  t.lat = lat; t.lng = lng; t.speed = sp; t.ts = Date.now(); save(); onData();
+  t.lat = lat; t.lng = lng; t.speed = sp; t.ts = Date.now(); saveTrip(me.routeId); onData();
 }
 function simulate(){
   if (sim) { clearInterval(sim); sim = null; $('#sim').textContent = 'Simulate drive (demo)'; return; }
@@ -225,7 +248,7 @@ function parentView(){
 }
 function markHouse(){ marking = true; $('#mkb').textContent = 'Tap your house on the map…'; }
 function useGps(){
-  navigator.geolocation.getCurrentPosition(p => { me.lat = p.coords.latitude; me.lng = p.coords.longitude; save(); fitted = false; onData(); }, e => alert(e.message));
+  navigator.geolocation.getCurrentPosition(p => { me.lat = p.coords.latitude; me.lng = p.coords.longitude; saveUser(me); fitted = false; onData(); }, e => alert(e.message));
 }
 function etaMin(t){ return dist([t.lat, t.lng], [me.lat, me.lng]) / (t.speed > 2 ? t.speed : 6) / 60; }
 function parentStatus(){
@@ -242,10 +265,10 @@ function parentStatus(){
 function check(){
   const t = S.trips[me.routeId];
   if (!t || !t.active || !t.lat || !me.lat) return;
-  t.alerted = t.alerted || {};
-  if (t.alerted[me.id]) return;
+  const ak = 'al_' + t.id + '_' + me.id;
+  if (localStorage.getItem(ak)) return;
   const m = etaMin(t);
-  if (m <= 5) { t.alerted[me.id] = 1; save(); showAlert(`🚌 Bus is about ${Math.max(1, Math.ceil(m))} min away from your stop!`); startRing(); }
+  if (m <= 5) { localStorage.setItem(ak, 1); showAlert(`🚌 Bus is about ${Math.max(1, Math.ceil(m))} min away from your stop!`); startRing(); }
 }
 function showAlert(msg){
   const a = $('#alert'); a.innerHTML = msg + '<br><button onclick="stopRing()">Stop sound</button>'; a.hidden = false;
