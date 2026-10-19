@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>School Transport Demo</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;font-size:14px;background:#f4f5f7;color:#222}
+button{background:#1a56db;color:#fff;border:0;border-radius:6px;padding:8px 12px;margin:2px;font-size:14px}
+button.red{background:#c0392b}button.gray{background:#667}
+input,select{padding:8px;margin:2px;border:1px solid #bbb;border-radius:6px;font-size:14px}
+#login{max-width:340px;margin:40px auto;background:#fff;padding:20px;border-radius:10px}
+#login input{width:100%}#app{display:flex;flex-direction:column;height:100vh}
+header{background:#1a56db;color:#fff;padding:8px 12px;display:flex;justify-content:space-between;align-items:center}
+#panel{padding:8px;max-height:45vh;overflow:auto;background:#fff}#map{flex:1;min-height:200px}
+table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #eee;padding:4px;text-align:left}
+.tabs button{background:#dde;color:#223}.tabs button.on{background:#1a56db;color:#fff}
+.ic{font-size:26px;text-align:center}.box{background:#eef3ff;padding:8px;border-radius:6px;margin:6px 0}
+#alert{position:fixed;top:0;left:0;right:0;background:#e67e22;color:#fff;padding:14px;z-index:9999;font-size:16px;text-align:center}
+small{color:#666}
+</style></head><body>
+<div id="login"><h3>🚌 School Transport Demo</h3>
+<input id="u" placeholder="Username"><input id="p" type="password" placeholder="Password">
+<button onclick="login()" style="width:100%;margin-top:8px">Login</button>
+<p><small>Demo logins:<br>admin / admin123<br>driver1 / 1234<br>parent1 / 1234, parent2 / 1234</small></p></div>
+<div id="app" hidden><header><b id="who"></b><button class="gray" onclick="location.reload()">Logout</button></header>
+<div id="panel"></div><div id="map"></div></div>
+<div id="alert" hidden></div>
+<script>
+// ---- CONFIG ----
+// Leave empty = data stays in this browser only (works across tabs of the same browser).
+// For testing on 2 different phones, paste a Firebase Realtime Database URL (test mode), e.g. "https://myapp-default-rtdb.firebaseio.com"
+const DB_URL = "";
+const KEY = "tms_demo_v1";
+
+const $ = s => document.querySelector(s);
+const seed = {
+  users: [
+    {id:'a1',role:'admin',name:'School Admin',user:'admin',pass:'admin123'},
+    {id:'d1',role:'driver',name:'Ramesh',user:'driver1',pass:'1234',vehicle:'BUS-01',routeId:'r1'},
+    {id:'p1',role:'parent',name:'Parent One',child:'Aarav',user:'parent1',pass:'1234',routeId:'r1',lat:28.6180,lng:77.2150},
+    {id:'p2',role:'parent',name:'Parent Two',child:'Diya',user:'parent2',pass:'1234',routeId:'r1',lat:28.6230,lng:77.2200}
+  ],
+  routes: [{id:'r1',name:'Route 1'}],
+  trips: {}
+};
+let S = JSON.parse(localStorage.getItem(KEY) || 'null') || seed;
+let me = null, map = null, mk = {}, tab = 'routes', fitted = false, nFit = 0, marking = false;
+let AC = null, ringT = null, watchId = null, sim = null;
+
+function save(){
+  localStorage.setItem(KEY, JSON.stringify(S));
+  if (DB_URL) fetch(DB_URL + '/tms.json', {method:'PUT', body:JSON.stringify(S)}).catch(()=>{});
+}
+function fix(){ S.users=S.users||[]; S.routes=S.routes||[]; S.trips=S.trips||{}; }
+fix();
+addEventListener('storage', e => { if (e.key === KEY && e.newValue) { S = JSON.parse(e.newValue); fix(); onData(); } });
+if (DB_URL) setInterval(async () => {
+  try {
+    const r = await (await fetch(DB_URL + '/tms.json')).json();
+    if (r && JSON.stringify(r) !== JSON.stringify(S)) { S = r; fix(); localStorage.setItem(KEY, JSON.stringify(S)); onData(); }
+  } catch (e) {}
+}, 2000);
+if (DB_URL) fetch(DB_URL + '/tms.json').then(r => r.json()).then(r => { if (!r) save(); });
+
+function dist(a, b){ // metres
+  const R = 6371000, t = x => x * Math.PI / 180;
+  const dLat = t(b[0]-a[0]), dLng = t(b[1]-a[1]);
+  const h = Math.sin(dLat/2)**2 + Math.cos(t(a[0]))*Math.cos(t(b[0]))*Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const rname = id => (S.routes.find(r => r.id == id) || {name:'-'}).name;
+const rOpts = sel => '<option value="">-- none --</option>' + S.routes.map(r => `<option value="${r.id}" ${r.id==sel?'selected':''}>${r.name}</option>`).join('');
+
+// ---- sound ----
+function beep(){
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.connect(g); g.connect(AC.destination); o.frequency.value = 880;
+  g.gain.setValueAtTime(.4, AC.currentTime); o.start(); o.stop(AC.currentTime + .35);
+}
+function startRing(){ stopRing(); if (!AC) return; beep(); ringT = setInterval(beep, 800); navigator.vibrate && navigator.vibrate([300,150,300]); }
+function stopRing(){ clearInterval(ringT); ringT = null; $('#alert').hidden = true; }
+
+// ---- login ----
+function login(){
+  const u = S.users.find(x => x.user === $('#u').value.trim() && x.pass === $('#p').value);
+  if (!u) return alert('Wrong username or password');
+  me = u;
+  AC = new (window.AudioContext || window.webkitAudioContext)(); AC.resume();
+  if (window.Notification && Notification.permission === 'default') Notification.requestPermission();
+  $('#login').hidden = true; $('#app').hidden = false;
+  $('#who').textContent = me.name + ' (' + me.role + ')';
+  map = L.map('map').setView([28.6139, 77.2090], 12);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution:'© OpenStreetMap', maxZoom:19}).addTo(map);
+  map.on('click', e => {
+    if (me.role == 'parent' && marking) {
+      marking = false; me.lat = e.latlng.lat; me.lng = e.latlng.lng; save(); fitted = false; view();
+    }
+  });
+  navigator.geolocation && navigator.geolocation.getCurrentPosition(p => { if (!fitted) map.setView([p.coords.latitude, p.coords.longitude], 14); });
+  view();
+}
+function view(){ ({admin:adminView, driver:driverView, parent:parentView})[me.role](); setTimeout(() => { map.invalidateSize(); onData(); }, 50); }
+
+function onData(){
+  if (!me) return;
+  me = S.users.find(u => u.id == me.id);
+  if (!me) return location.reload();
+  if (me.role == 'admin') adminList();
+  if (me.role == 'driver') driverStatus();
+  if (me.role == 'parent') { parentStatus(); check(); }
+  drawMap();
+}
+
+// ---- map ----
+function drawMap(){
+  const w = {};
+  const buses = me.role == 'admin' ? Object.keys(S.trips) : [me.routeId];
+  buses.forEach(r => {
+    const t = S.trips[r];
+    if (t && t.active && t.lat) w['b'+r] = [[t.lat, t.lng], '🚌', rname(r) + ' (' + t.type + ')'];
+  });
+  S.users.filter(u => u.role == 'parent' && u.lat && (me.role == 'admin' || (me.role == 'driver' && u.routeId == me.routeId) || u.id == me.id))
+    .forEach(u => w['h'+u.id] = [[u.lat, u.lng], '🏠', u.child + ' (' + u.name + ')']);
+  Object.keys(mk).forEach(k => { if (!w[k]) { map.removeLayer(mk[k]); delete mk[k]; } });
+  Object.entries(w).forEach(([k, [ll, ic, tip]]) => {
+    if (mk[k]) mk[k].setLatLng(ll).setTooltipContent(tip);
+    else mk[k] = L.marker(ll, {icon: L.divIcon({html: ic, className: 'ic', iconSize: [30,30]})}).addTo(map).bindTooltip(tip);
+  });
+  const all = Object.values(w).map(x => x[0]);
+  if (all.length && (!fitted || all.length != nFit)) { map.fitBounds(all, {padding:[40,40], maxZoom:16}); fitted = true; nFit = all.length; }
+}
+
+// ---- ADMIN ----
+function adminView(){
+  const T = ['routes','drivers','parents','live'];
+  $('#panel').innerHTML = '<div class="tabs">' + T.map(t => `<button class="${t==tab?'on':''}" onclick="tab='${t}';view()">${t}</button>`).join('') + '</div><div id="form"></div><div id="list"></div>';
+  const f = $('#form');
+  if (tab == 'routes') f.innerHTML = '<input id="f1" placeholder="Route name"><button onclick="addRoute()">Add route</button>';
+  if (tab == 'drivers') f.innerHTML = '<input id="f1" placeholder="Name"><input id="f2" placeholder="Username"><input id="f3" placeholder="Password"><input id="f4" placeholder="Vehicle no"><select id="fr">' + rOpts() + '</select><button onclick="addUser(\'driver\')">Add driver</button>';
+  if (tab == 'parents') f.innerHTML = '<input id="f1" placeholder="Parent name"><input id="f2" placeholder="Username"><input id="f3" placeholder="Password"><input id="f4" placeholder="Child name"><select id="fr">' + rOpts() + '</select><button onclick="addUser(\'parent\')">Add parent</button>';
+  $('#map').style.display = tab == 'live' ? 'block' : 'none';
+  if (tab == 'live') fitted = false;
+}
+function addRoute(){ const n = $('#f1').value.trim(); if (!n) return; S.routes.push({id:'r'+Date.now(), name:n}); save(); view(); }
+function addUser(role){
+  const g = i => $('#f'+i).value.trim();
+  if (!g(1) || !g(2) || !g(3)) return alert('Fill name, username, password');
+  if (S.users.some(u => u.user == g(2))) return alert('Username already exists');
+  const u = {id:'u'+Date.now(), role, name:g(1), user:g(2), pass:g(3), routeId:$('#fr').value};
+  if (role == 'driver') u.vehicle = g(4); else u.child = g(4);
+  S.users.push(u); save(); view();
+}
+function assign(id, r){ S.users.find(u => u.id == id).routeId = r; save(); }
+function del(id, kind){
+  if (!confirm('Delete?')) return;
+  if (kind == 'route') { S.routes = S.routes.filter(r => r.id != id); S.users.forEach(u => { if (u.routeId == id) u.routeId = ''; }); }
+  else S.users = S.users.filter(u => u.id != id);
+  save(); view();
+}
+function adminList(){
+  const L = $('#list'); if (!L) return; let h = '';
+  if (tab == 'routes') h = '<table>' + S.routes.map(r => `<tr><td>${r.name}</td><td>${S.trips[r.id] && S.trips[r.id].active ? '🟢 trip running' : '⚪ idle'}</td><td><button class="red" onclick="del('${r.id}','route')">✕</button></td></tr>`).join('') + '</table>';
+  if (tab == 'drivers') h = '<table><tr><th>Driver</th><th>Login</th><th>Vehicle</th><th>Route</th><th></th></tr>' + S.users.filter(u => u.role == 'driver').map(u => `<tr><td>${u.name}</td><td>${u.user}/${u.pass}</td><td>${u.vehicle||''}</td><td><select onchange="assign('${u.id}',this.value)">${rOpts(u.routeId)}</select></td><td><button class="red" onclick="del('${u.id}')">✕</button></td></tr>`).join('') + '</table>';
+  if (tab == 'parents') h = '<table><tr><th>Parent</th><th>Child</th><th>Login</th><th>Route</th><th>House</th><th></th></tr>' + S.users.filter(u => u.role == 'parent').map(u => `<tr><td>${u.name}</td><td>${u.child||''}</td><td>${u.user}/${u.pass}</td><td><select onchange="assign('${u.id}',this.value)">${rOpts(u.routeId)}</select></td><td>${u.lat ? '✅' : '❌'}</td><td><button class="red" onclick="del('${u.id}')">✕</button></td></tr>`).join('') + '</table>';
+  if (tab == 'live') { const a = Object.entries(S.trips).filter(([r, t]) => t.active); h = a.length ? a.map(([r, t]) => `<div class="box">🚌 ${rname(r)} — ${t.type} — ${t.lat ? 'GPS ok' : 'waiting for GPS'}</div>`).join('') : '<small>No trips running.</small>'; }
+  L.innerHTML = h;
+}
+
+// ---- DRIVER ----
+function driverView(){
+  $('#panel').innerHTML = `<div class="box">Vehicle: <b>${me.vehicle||'-'}</b> &nbsp; Route: <b>${rname(me.routeId)}</b></div>
+  <select id="tt"><option value="pickup">Pickup (home → school)</option><option value="drop">Drop (school → home)</option></select>
+  <button id="go" onclick="toggleTrip()">▶ Start trip</button>
+  <button id="sim" class="gray" onclick="simulate()">Simulate drive (demo)</button><div id="st" class="box"></div>`;
+}
+function myTrip(){ return S.trips[me.routeId]; }
+function driverStatus(){
+  if (!$('#st')) return;
+  const t = myTrip(), on = t && t.active;
+  $('#go').textContent = on ? '■ End trip' : '▶ Start trip';
+  $('#go').className = on ? 'red' : '';
+  $('#st').textContent = !me.routeId ? 'Admin has not assigned you a route yet.' : on ? `Trip running (${t.type}). ` + (t.lat ? 'Sharing live location ✔' : 'Waiting for GPS…') : 'No trip running.';
+}
+function toggleTrip(){
+  if (!me.routeId) return alert('No route assigned');
+  const t = myTrip();
+  if (t && t.active) {
+    t.active = false; save(); navigator.geolocation.clearWatch(watchId); clearInterval(sim); sim = null;
+  } else {
+    S.trips[me.routeId] = {id:Date.now(), active:true, type:$('#tt').value, driverId:me.id, lat:null, lng:null, speed:0, ts:Date.now(), alerted:{}};
+    save();
+    watchId = navigator.geolocation.watchPosition(
+      p => setPos(p.coords.latitude, p.coords.longitude, p.coords.speed || 0),
+      e => { $('#st').textContent = 'GPS error: ' + e.message + ' (use Simulate)'; },
+      {enableHighAccuracy:true, maximumAge:2000});
+  }
+  onData();
+}
+function setPos(lat, lng, sp){
+  const t = myTrip(); if (!t || !t.active) return;
+  t.lat = lat; t.lng = lng; t.speed = sp; t.ts = Date.now(); save(); onData();
+}
+function simulate(){
+  if (sim) { clearInterval(sim); sim = null; $('#sim').textContent = 'Simulate drive (demo)'; return; }
+  const t = myTrip(); if (!t || !t.active) return alert('Start trip first');
+  let pts = S.users.filter(u => u.role == 'parent' && u.routeId == me.routeId && u.lat).map(u => [u.lat, u.lng]);
+  if (!pts.length) return alert('No parent has marked a house yet');
+  if (t.type == 'drop') pts.reverse();
+  let cur = t.lat ? [t.lat, t.lng] : [pts[0][0] + .05, pts[0][1] + .05], i = 0;
+  $('#sim').textContent = 'Stop simulation';
+  sim = setInterval(() => {
+    if (i >= pts.length) { clearInterval(sim); sim = null; $('#sim').textContent = 'Simulate drive (demo)'; return; }
+    const dy = pts[i][0] - cur[0], dx = pts[i][1] - cur[1], d = Math.hypot(dy, dx), step = .0002;
+    if (d < step) { cur = pts[i].slice(); i++; } else cur = [cur[0] + dy / d * step, cur[1] + dx / d * step];
+    setPos(cur[0], cur[1], 22);
+  }, 1000);
+}
+
+// ---- PARENT ----
+function parentView(){
+  $('#panel').innerHTML = `<div class="box"><b>${me.child||''}</b> — ${rname(me.routeId)}</div><div id="st" class="box"></div>
+  <button id="mkb" onclick="markHouse()">📍 Mark my house on map</button>
+  <button class="gray" onclick="useGps()">Use my current location</button>
+  <button class="gray" onclick="startRing();showAlert('Test alert')">🔔 Test sound</button>`;
+}
+function markHouse(){ marking = true; $('#mkb').textContent = 'Tap your house on the map…'; }
+function useGps(){
+  navigator.geolocation.getCurrentPosition(p => { me.lat = p.coords.latitude; me.lng = p.coords.longitude; save(); fitted = false; onData(); }, e => alert(e.message));
+}
+function etaMin(t){ return dist([t.lat, t.lng], [me.lat, me.lng]) / (t.speed > 2 ? t.speed : 6) / 60; }
+function parentStatus(){
+  if (!$('#st')) return;
+  const t = S.trips[me.routeId]; let s = '';
+  if (!me.lat) s = '⚠ Mark your house on the map to get arrival alerts. ';
+  if (t && t.active) {
+    s += `🚌 ${t.type} trip running. `;
+    if (!t.lat) s += 'Waiting for driver GPS…';
+    else if (me.lat) s += `${(dist([t.lat, t.lng], [me.lat, me.lng]) / 1000).toFixed(1)} km away, ETA ~${Math.ceil(etaMin(t))} min. (updated ${Math.round((Date.now() - t.ts) / 1000)}s ago)`;
+  } else s += 'No trip running right now.';
+  $('#st').textContent = s;
+}
+function check(){
+  const t = S.trips[me.routeId];
+  if (!t || !t.active || !t.lat || !me.lat) return;
+  t.alerted = t.alerted || {};
+  if (t.alerted[me.id]) return;
+  const m = etaMin(t);
+  if (m <= 5) { t.alerted[me.id] = 1; save(); showAlert(`🚌 Bus is about ${Math.max(1, Math.ceil(m))} min away from your stop!`); startRing(); }
+}
+function showAlert(msg){
+  const a = $('#alert'); a.innerHTML = msg + '<br><button onclick="stopRing()">Stop sound</button>'; a.hidden = false;
+  try { if (Notification.permission == 'granted') new Notification('School Bus', {body: msg}); } catch (e) {}
+}
+</script></body></html>
