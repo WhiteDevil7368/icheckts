@@ -3,6 +3,7 @@
 <title>School Transport Demo</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
 <style>
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;font-size:14px;background:#f4f5f7;color:#222}
 button{background:#1a56db;color:#fff;border:0;border-radius:6px;padding:8px 12px;margin:2px;font-size:14px}
@@ -19,19 +20,17 @@ table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #eee;pad
 small{color:#666}
 </style></head><body>
 <div id="login"><h3>🚌 School Transport Demo</h3>
+<input id="code" placeholder="School code (same for everyone, e.g. myschool)">
 <input id="u" placeholder="Username"><input id="p" type="password" placeholder="Password">
-<button id="lb" onclick="login()" style="width:100%;margin-top:8px">Login</button>
-<p id="warn" style="color:#c0392b;font-weight:bold" hidden>⚠ LOCAL MODE: other phones will NOT see your data. Set DB_URL in the script (see README steps).</p><p><small>Demo logins:<br>admin / admin123<br>driver1 / 1234<br>parent1 / 1234, parent2 / 1234</small></p></div>
+<button id="lb" onclick="login(false)" style="width:100%;margin-top:8px">Login (driver / parent)</button>
+<button id="ab" class="gray" onclick="login(true)" style="width:100%">Admin login (starts the school server)</button>
+<p><small>Admin must login first and keep that page open. Then drivers and parents login with the same school code.<br><br>Demo logins:<br>admin / admin123<br>driver1 / 1234<br>parent1 / 1234, parent2 / 1234</small></p></div>
 <div id="app" hidden><header><b id="who"></b><span id="sync"></span><button class="gray" onclick="location.reload()">Logout</button></header>
 <div id="panel"></div><div id="map"></div></div>
 <div id="alert" hidden></div>
 <script>
-// ---- CONFIG ----
-// Paste your Firebase Realtime Database URL here so all phones share data. Example:
-// const DB_URL = "https://myschool-default-rtdb.firebaseio.com";
-const DB_URL = "";
-const KEY = "tms_demo_v2";
-
+// ---- NO DATABASE: admin's device is the host. Others connect to it with PeerJS (WebRTC). ----
+const KEY = "tms_demo_v3";
 const $ = s => document.querySelector(s);
 const seed = {
   users: [
@@ -44,44 +43,74 @@ const seed = {
   trips: {}
 };
 let S = JSON.parse(localStorage.getItem(KEY) || 'null') || JSON.parse(JSON.stringify(seed));
-let me = null, map = null, mk = {}, tab = 'routes', fitted = false, nFit = 0, marking = false, pending = 0;
-let AC = null, ringT = null, watchId = null, sim = null;
+let me = null, map = null, mk = {}, tab = 'routes', fitted = false, nFit = 0, marking = false;
+let AC = null, ringT = null, watchId = null, sim = null, wake = null;
+let rt = null, peer = null, conn = null, isHost = false, conns = [], creds = null, hostId = '';
 function fix(){ S.users=S.users||[]; S.routes=S.routes||[]; S.trips=S.trips||{}; }
 fix();
-function cache(){ localStorage.setItem(KEY, JSON.stringify(S)); }
+function cache(){ if (isHost) localStorage.setItem(KEY, JSON.stringify(S)); }
+function setSync(txt){ const e = $('#sync'); if (e) e.textContent = txt; }
 
-// Granular writes: each record is saved on its own path, so devices never overwrite each other.
-async function put(path, val){
+// Host: send state (without passwords) to every connected phone
+function broadcast(){
   cache();
-  if (!DB_URL) return;
-  pending++;
-  try { await fetch(DB_URL + '/tms/' + path + '.json', {method: val === null ? 'DELETE' : 'PUT', body: JSON.stringify(val)}); setSync(true); }
-  catch (e) { setSync(false); }
-  pending--;
+  const pub = {users: S.users.map(u => ({...u, pass: undefined})), routes: S.routes, trips: S.trips};
+  conns.forEach(c => { if (c.open && c.uid) c.send({t:'state', s:pub}); });
+  setSync('🟢 hosting · ' + conns.filter(c => c.open && c.uid).length + ' connected');
 }
-const saveUser = u => put('users/' + u.id, u);
-const delUser = id => put('users/' + id, null);
-const saveRoute = r => put('routes/' + r.id, r);
-const delRoute = id => put('routes/' + id, null);
-const saveTrip = rid => put('trips/' + rid, S.trips[rid]);
-function setSync(ok){ const e = $('#sync'); if (e) e.textContent = !DB_URL ? '⚠ local only' : ok ? '🟢 synced' : '🔴 sync error'; }
-
-async function pull(){
-  try {
-    const r = await (await fetch(DB_URL + '/tms.json')).json();
-    if (!r || !r.users) { seed.users.forEach(u => put('users/' + u.id, u)); seed.routes.forEach(x => put('routes/' + x.id, x)); S = JSON.parse(JSON.stringify(seed)); }
-    else S = {users: Object.values(r.users || {}).filter(Boolean), routes: Object.values(r.routes || {}).filter(Boolean), trips: r.trips || {}};
-    fix(); cache(); setSync(true); return true;
-  } catch (e) { setSync(false); return false; }
+function hostMsg(c, m){
+  if (m.t == 'login') {
+    const u = S.users.find(x => x.role != 'admin' && x.user === m.user && x.pass === m.pass);
+    if (!u) return c.send({t:'bad'});
+    c.uid = u.id; conns = conns.filter(x => x !== c); conns.push(c);
+    c.send({t:'state', uid:u.id, s:{users:S.users.map(u => ({...u, pass: undefined})), routes:S.routes, trips:S.trips}});
+    return broadcast();
+  }
+  const u = S.users.find(x => x.id == c.uid); if (!u) return;
+  if (m.t == 'user' && u.role == 'parent') { u.lat = m.lat; u.lng = m.lng; }
+  else if (m.t == 'trip' && u.role == 'driver' && m.rid == u.routeId) S.trips[m.rid] = m.trip;
+  else return;
+  broadcast(); onData();
 }
-addEventListener('storage', e => { if (!DB_URL && e.key === KEY && e.newValue) { S = JSON.parse(e.newValue); fix(); onData(); } });
-if (DB_URL) setInterval(async () => {
-  if (pending) return;
-  const old = JSON.stringify(S);
-  if (await pull() && JSON.stringify(S) !== old) onData();
-}, 2000);
-$('#warn').hidden = !!DB_URL;
+// Save helpers: host saves + broadcasts; clients send to host
+function saveUser(u){ if (isHost) broadcast(); else conn && conn.open && conn.send({t:'user', lat:u.lat, lng:u.lng}); }
+function delUser(){ broadcast(); }
+function saveRoute(){ broadcast(); }
+function delRoute(){ broadcast(); }
+function saveTrip(rid){ if (isHost) broadcast(); else conn && conn.open && conn.send({t:'trip', rid, trip:S.trips[rid]}); }
 
+function startHost(){
+  return new Promise((ok, fail) => {
+    peer = new Peer(hostId);
+    peer.on('open', () => { isHost = true; ok(); });
+    peer.on('error', e => fail(e.type == 'unavailable-id' ? 'This school code is already hosted by another admin page (or wait 30 sec after refresh and try again).' : 'Connection error: ' + e.type));
+    peer.on('connection', c => { c.on('data', m => hostMsg(c, m)); c.on('close', () => { conns = conns.filter(x => x !== c); broadcast(); }); });
+  });
+}
+function connectClient(first){
+  return new Promise((ok, fail) => {
+    try { peer && peer.destroy(); } catch (e) {}
+    peer = new Peer();
+    let done = false;
+    const t = setTimeout(() => { if (!done) { done = true; first ? fail('Cannot reach admin. Is the admin logged in with this school code?') : retry(); } }, 12000);
+    const retry = () => { if (rt) return; setSync('🔴 reconnecting…'); rt = setTimeout(() => { rt = null; connectClient(false); }, 3000); };
+    peer.on('error', e => { if (!done) { done = true; clearTimeout(t); first ? fail('Cannot reach admin (' + e.type + '). Admin must be logged in first.') : retry(); } });
+    peer.on('open', () => {
+      conn = peer.connect(hostId, {reliable:true});
+      conn.on('open', () => conn.send({t:'login', user:creds.user, pass:creds.pass}));
+      const mine = conn;
+      conn.on('close', () => { if (conn === mine) retry(); });
+      conn.on('data', m => {
+        if (m.t == 'bad') { if (!done) { done = true; clearTimeout(t); fail('Wrong username or password'); } return; }
+        if (m.t == 'state') {
+          S = m.s; fix();
+          if (!done) { done = true; clearTimeout(t); me = S.users.find(u => u.id == m.uid); ok(); if (map) { setSync('🟢 connected'); onData(); } }
+          else { setSync('🟢 connected'); onData(); }
+        }
+      });
+    });
+  });
+}
 function dist(a, b){ // metres
   const R = 6371000, t = x => x * Math.PI / 180;
   const dLat = t(b[0]-a[0]), dLng = t(b[1]-a[1]);
@@ -101,18 +130,25 @@ function startRing(){ stopRing(); if (!AC) return; beep(); ringT = setInterval(b
 function stopRing(){ clearInterval(ringT); ringT = null; $('#alert').hidden = true; }
 
 // ---- login ----
-async function login(){
-  $('#lb').textContent = 'Connecting…';
-  if (DB_URL && !(await pull())) { $('#lb').textContent = 'Login'; return alert('Cannot reach database. Check DB_URL and Firebase rules.'); }
-  $('#lb').textContent = 'Login';
-  const u = S.users.find(x => x.user === $('#u').value.trim() && x.pass === $('#p').value);
-  if (!u) return alert('Wrong username or password');
-  me = u;
+async function login(admin){
+  const code = $('#code').value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!code) return alert('Enter a school code');
+  hostId = 'tms-demo-' + code + '-host';
+  const user = $('#u').value.trim(), pass = $('#p').value;
   AC = new (window.AudioContext || window.webkitAudioContext)(); AC.resume();
+  const btn = admin ? $('#ab') : $('#lb'), old = btn.textContent; btn.textContent = 'Connecting…';
+  try {
+    if (admin) {
+      me = S.users.find(x => x.role == 'admin' && x.user === user && x.pass === pass);
+      if (!me) throw 'Wrong admin username or password';
+      await startHost();
+    } else { creds = {user, pass}; await connectClient(true); if (!me) throw 'Login failed'; }
+  } catch (e) { btn.textContent = old; return alert(e); }
+  btn.textContent = old;
   if (window.Notification && Notification.permission === 'default') Notification.requestPermission();
-  $('#login').hidden = true; $('#app').hidden = false; setSync(true);
+  $('#login').hidden = true; $('#app').hidden = false; setSync(admin ? '🟢 hosting' : '🟢 connected');
   $('#who').textContent = me.name + ' (' + me.role + ')';
-  map = L.map('map').setView([28.6139, 77.2090], 12);
+  map = L.map('map').setView([22.5, 79], 5);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution:'© OpenStreetMap', maxZoom:19}).addTo(map);
   map.on('click', e => {
     if (me.role == 'parent' && marking) {
@@ -120,7 +156,7 @@ async function login(){
     }
   });
   navigator.geolocation && navigator.geolocation.getCurrentPosition(p => { if (!fitted) map.setView([p.coords.latitude, p.coords.longitude], 14); });
-  view();
+  view(); if (admin) broadcast();
 }
 function view(){ ({admin:adminView, driver:driverView, parent:parentView})[me.role](); setTimeout(() => { map.invalidateSize(); onData(); }, 50); }
 
@@ -204,12 +240,14 @@ function driverStatus(){
   $('#go').className = on ? 'red' : '';
   $('#st').textContent = !me.routeId ? 'Admin has not assigned you a route yet.' : on ? `Trip running (${t.type}). ` + (t.lat ? 'Sharing live location ✔' : 'Waiting for GPS…') : 'No trip running.';
 }
+async function keepAwake(){ try { wake = await navigator.wakeLock.request('screen'); } catch (e) {} }
 function toggleTrip(){
   if (!me.routeId) return alert('No route assigned');
   const t = myTrip();
   if (t && t.active) {
     t.active = false; saveTrip(me.routeId); navigator.geolocation.clearWatch(watchId); clearInterval(sim); sim = null;
   } else {
+    keepAwake();
     S.trips[me.routeId] = {id:Date.now(), active:true, type:$('#tt').value, driverId:me.id, lat:null, lng:null, speed:0, ts:Date.now()};
     saveTrip(me.routeId);
     watchId = navigator.geolocation.watchPosition(
