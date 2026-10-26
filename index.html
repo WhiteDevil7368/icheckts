@@ -30,6 +30,7 @@
   #mapbox{height:45vh;min-height:280px;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#dde3ec;margin-bottom:12px;position:relative}
   #mapbox iframe{width:100%;height:100%;border:0}
   #gmap{width:100%;height:100%}
+  .maphint{position:absolute;left:50%;top:10px;transform:translateX(-50%);background:rgba(255,255,255,.92);padding:6px 12px;border-radius:999px;font-size:13px;z-index:3;pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,.25)}
   .hidden{display:none!important}
   .banner{background:#fff4ce;border:1px solid #f0d878;padding:10px;border-radius:8px;margin-bottom:12px;font-weight:600}
   .big{font-size:22px;font-weight:700}
@@ -58,7 +59,7 @@
     <select id="focusRoute" class="hidden"></select>
     <button id="btnFollow" class="sec sm">📍 Following: on</button>
   </div>
-  <div id="mapbox"><div id="gmap"></div></div>
+  <div id="mapbox"><div id="gmap"></div><div id="mapHint" class="maphint">Waiting for the bus location…</div></div>
   <div id="panel"></div>
   <button id="btnLogout" class="sec">Log out</button>
 </div>
@@ -130,6 +131,7 @@ function mapUpdate(items){ GM.items = items; mapRender(); }
 
 function mapRender(){
   const items = GM.items;
+  $('mapHint').classList.toggle('hidden', items.some(i => i.kind === 'bus'));
   const useJs = GM.key && GM.ready && !GM.failed && window.google && google.maps;
   $('gmap').classList.toggle('hidden', !useJs);
   const old = $('mapbox').querySelector('iframe');
@@ -144,6 +146,7 @@ function mapRender(){
       GM.map.addListener('dragstart', () => { GM.follow = false; $('btnFollow').textContent = '📍 Following: off'; });
       GM.map.addListener('renderingtype_changed', () => { GM.vector = GM.map.getRenderingType() === 'VECTOR'; });
     }
+    if (!items.length && GM.home && !GM.homed){ GM.homed = true; GM.map.setCenter(GM.home); GM.map.setZoom(14); }
     const seen = new Set();
     items.forEach(it => {
       seen.add(it.id);
@@ -166,14 +169,17 @@ function mapRender(){
       }
     }
   } else {
-    /* keyless fallback: Google Maps embed, centred on the first bus */
-    const t = items.find(i => i.kind === 'bus') || items[0];
-    if (!t){ if (old) old.remove(); return; }
+    /* keyless fallback: Google Maps embed, centred on the first bus (or on this phone / India until a bus reports) */
+    const t = items.find(i => i.kind === 'bus') || items[0] || GM.home || null;
+    if (!t){
+      if (!old){ const f0 = document.createElement('iframe'); f0.src = 'https://maps.google.com/maps?q=India&z=5&output=embed'; $('mapbox').appendChild(f0); }
+      return;
+    }
     const moved = !GM.fbLast || distM(GM.fbLast, t) > 15;
     if (old && (!moved || Date.now() - GM.fbSrcAt < 6000)) return;
     GM.fbLast = {lat:t.lat, lng:t.lng}; GM.fbSrcAt = Date.now();
     const f = old || document.createElement('iframe');
-    f.src = 'https://maps.google.com/maps?q=' + t.lat + ',' + t.lng + '&z=16&output=embed';
+    f.src = 'https://maps.google.com/maps?q=' + t.lat + ',' + t.lng + '&z=' + (items.length ? 16 : 14) + '&output=embed';
     if (!old) $('mapbox').appendChild(f);
   }
 }
@@ -243,7 +249,8 @@ function hostCount(){ setStatus('🟢 hosting · ' + sessions.size + ' connected
 function hostOnData(c, d){
   if (!d || typeof d !== 'object') return;
   if (d.type === 'login'){
-    const u = db.users.find(x => x.u === d.u && x.p === d.p);
+    const du = String(d.u || '').trim().toLowerCase(), dp = String(d.p || '').trim();
+    const u = db.users.find(x => x.u.toLowerCase() === du && String(x.p).trim() === dp);
     if (!u){ c.send({type:'login-fail'}); return; }
     // drop any older session for the same user
     sessions.forEach((s, oc) => { if (s.user === u.u && oc !== c){ try { oc.close(); } catch(e){} sessions.delete(oc); } });
@@ -277,6 +284,9 @@ function renderAdmin(){
   const online = u => [...sessions.values()].some(s => s.user === u.u);
   const rname = id => (routes.find(r => r.id === id) || {name:'—'}).name;
   $('panel').innerHTML = `
+    <div class="card"><h2>Share with drivers and parents</h2>
+      <p>School code: <b>${esc(schoolCode)}</b></p>
+      <p class="mut">${users.some(u => u.role === 'driver') ? 'Drivers log in with the username and password added below.' : '⚠ No driver added yet. Add one below first, or driver login will fail.'}</p></div>
     <div class="card"><h2>Live buses</h2><div id="live"></div></div>
     <div class="card"><h2>Google Maps key (optional)</h2>
       <input id="mk" placeholder="Maps JavaScript API key" value="${esc(db.mapsKey)}">
@@ -296,9 +306,9 @@ function renderAdmin(){
   $('mkSave').onclick = () => { db.mapsKey = $('mk').value.trim(); db.mapId = $('mid').value.trim() || 'DEMO_MAP_ID'; saveDb(); mapSetKey(db.mapsKey, db.mapId); alert('Saved. New logins get the key and Map ID. Reload this page to apply changes here.'); };
   $('rAdd').onclick = () => { const n = $('rn').value.trim(); if (!n) return; db.routes.push({id:uid(), name:n}); saveDb(); renderAdmin(); };
   $('uAdd').onclick = () => {
-    const u = $('nu').value.trim(), p = $('np').value, n = $('nn').value.trim() || u;
+    const u = $('nu').value.trim(), p = $('np').value.trim(), n = $('nn').value.trim() || u;
     if (!u || !p){ $('uErr').textContent = 'Username and password required'; return; }
-    if (u === 'admin' || db.users.some(x => x.u === u)){ $('uErr').textContent = 'Username already taken'; return; }
+    if (u.toLowerCase() === 'admin' || db.users.some(x => x.u.toLowerCase() === u.toLowerCase())){ $('uErr').textContent = 'Username already taken'; return; }
     if (!$('nroute').value){ $('uErr').textContent = 'Add a route first'; return; }
     db.users.push({u, p, name:n, role:$('nr').value, routeId:$('nroute').value}); saveDb(); renderAdmin();
   };
@@ -335,9 +345,13 @@ function updateAdminMap(){
 setInterval(() => { if (role === 'admin') renderAdminLive(); }, 5000);
 
 /* ============================ CLIENT (driver / parent) ============================ */
+let loginTimer = null;
+function hint(m){ if (!$('loginView').classList.contains('hidden')) $('loginErr').textContent = m; }
 function startClient(u, p){
   creds = {u, p}; loggedIn = false; role = null;
-  setStatus('🟡 connecting…');
+  setStatus('🟡 connecting…'); hint('Connecting to school "' + schoolCode + '"…');
+  clearTimeout(loginTimer);
+  loginTimer = setTimeout(() => { if (!loggedIn) hint('Still cannot reach the admin. Check that the admin page is open and logged in, the school code matches, and try Wi-Fi.'); }, 12000);
   clientPeer();
 }
 function clientPeer(){
@@ -346,8 +360,8 @@ function clientPeer(){
   peer.on('open', openConn);
   peer.on('disconnected', () => { try { peer.reconnect(); } catch(e){} });
   peer.on('error', e => {
-    if (e.type === 'peer-unavailable') setStatus('🟠 admin offline, retrying…');
-    else setStatus('🔴 ' + e.type);
+    if (e.type === 'peer-unavailable'){ setStatus('🟠 admin offline, retrying…'); hint('Admin is not online for school code "' + schoolCode + '". The admin must open the page and log in first.'); }
+    else { setStatus('🔴 ' + e.type); hint('Connection problem: ' + e.type + '. If this says network or server-error, the PeerJS server cannot be reached; check the internet.'); }
     scheduleRetry();
   });
 }
@@ -375,14 +389,15 @@ function clientOnData(d){
   }
   if (d.type === 'login-ok'){
     const first = !loggedIn;
+    clearTimeout(loginTimer); $('loginErr').textContent = '';
     loggedIn = true; role = d.role; me = d.name; myRoute = d.route; myStop = d.stop; mapSetKey(d.mapsKey, d.mapId);
     setStatus('🟢 connected');
     if (first){ showApp(); }
     if (role === 'driver') renderDriver(); else renderParent();
-    if (d.last){ last[myRoute.id] = d.last; parentUpdate(); }
+    if (d.last && myRoute){ last[myRoute.id] = d.last; parentUpdate(); }
     if (role === 'driver' && tripOn) sendFix();
   }
-  if (d.type === 'loc'){ last[myRoute.id] = d.p; parentUpdate(); }
+  if (d.type === 'loc' && myRoute){ last[myRoute.id] = d.p; parentUpdate(); }
   if (d.type === 'stop'){ myStop = d.stop; parentUpdate(); renderParent(); }
 }
 const send = m => { try { conn && conn.open && conn.send(m); } catch(e){} };
@@ -468,7 +483,15 @@ function showLogin(msg){
   $('loginErr').textContent = msg || ''; setStatus('⚪ offline');
   role = null; loggedIn = false;
 }
-function showApp(){ $('loginView').classList.add('hidden'); $('appView').classList.remove('hidden'); }
+function showApp(){
+  $('loginView').classList.add('hidden'); $('appView').classList.remove('hidden');
+  mapRender();
+  try {
+    navigator.geolocation && navigator.geolocation.getCurrentPosition(
+      p => { GM.home = {lat:p.coords.latitude, lng:p.coords.longitude}; GM.homed = false; mapRender(); },
+      () => {}, {timeout:8000, maximumAge:60000});
+  } catch(e){}
+}
 
 function doLogin(asAdmin){
   unlockAudio();
